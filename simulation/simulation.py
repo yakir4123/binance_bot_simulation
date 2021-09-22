@@ -5,9 +5,11 @@ import asyncio
 import pandas as pd
 
 from binance import Client
-from collections import Iterable
+from typing import Iterable
+
+from binance_bot_simulation.exchange_bots.strategy import Strategy
 from common import mkdirs, timing
-from exchange_bots.Portfolio import InitialPortfolio
+from binance_bot_simulation.exchange_bots.portfolio import InitialPortfolio
 from binance_bot_simulation.simulation.simulation_exchange_bot import SimulationExchangeBot
 from binance_bot_simulation.binance.binance_download_data import download_data, change_df_types
 
@@ -21,21 +23,33 @@ class Simulation:
     """
 
     def __init__(self,
-                 strategy,
-                 simulation_data,
-                 verbose=False):
+                 simulation_start_time: pd.Timestamp = None,
+                 verbose=True):
         self.verbose = verbose
+        self.strategy = None
+        self.simulation_data_feeds = {}
+        self.simulation_start_time = simulation_start_time
+        self.exchange = SimulationExchangeBot()
+        
+    def create_portfolio(self, **coins):
+        self.exchange.create_portfolio(self.simulation_start_time, **coins)
+
+    def add_data_feed(self, coin: str, interval: str, data_feed: pd.DataFrame):
+        if coin not in self.simulation_data_feeds:
+            self.simulation_data_feeds[coin] = {}
+        if interval in self.simulation_data_feeds[coin]:
+            raise ValueError(f'{coin}/{interval} is already in the simulation.')
+        self.simulation_data_feeds[coin][interval] = data_feed.loc[data_feed.index >= self.simulation_start_time]
+        self.exchange.add_history(coin, interval, data_feed.loc[data_feed.index < self.simulation_start_time])
+
+    def add_strategy(self, strategy: Strategy):
         self.strategy = strategy
-        self.simulation_data = simulation_data
-        self.simulation_exchange = strategy.exchange
+        self.strategy.set_exchange(self.exchange)
 
     def start(self):
         """
         start the simulation loop,
         The simulation create a loop with tick on the smallest dataframe interval.
-
-        :param tick: ticks of time that says that a candle is closed,
-         default will be the minimum tick that the test data use
         """
 
         loop = asyncio.get_event_loop()
@@ -43,9 +57,11 @@ class Simulation:
 
     async def async_start(self):
         await self.strategy.prepare_strategy()
+        # free a lot of ram
+        self.exchange.history_data = None
 
         concatenate_df = []
-        for coin, dfs in self.simulation_data.items():
+        for coin, dfs in self.simulation_data_feeds.items():
             concatenate_df += list(dfs.values())
         concatenate_df = pd.concat(concatenate_df)
         concatenate_df = concatenate_df.rename_axis('Close time').sort_values(
@@ -56,8 +72,8 @@ class Simulation:
         verbose_i = 0
         if self.verbose:
             print_progress_bar(verbose_i, total_ticks,
-                               prefix=f'{concatenate_df.index[0]}: {self.simulation_exchange.portfolio.portfolio_worth():.2f}',
-                               suffix=str(self.simulation_exchange.portfolio),
+                               prefix=f'{concatenate_df.index[0]}: {self.exchange.portfolio.portfolio_worth():.2f}',
+                               suffix=str(self.exchange.portfolio),
                                length=10)
         timestamp = None
         for row in concatenate_df.itertuples():
@@ -72,17 +88,18 @@ class Simulation:
                 'Close time': row.Index,
                 'Coin': row.Coin
             }
-            await self.strategy.candle_close(row.interval, candle['Close time'], candle)
+            self.exchange.record_candle(row.interval, candle)
+            await self.strategy.candle_close(row.interval, candle)
 
             if candle['Close time'] != timestamp:
                 timestamp = candle['Close time']
-                self.simulation_exchange.update_orders(timestamp, candle['Close'])
+                self.exchange.update_orders(timestamp, candle['Close'])
 
             if self.verbose:
                 verbose_i += 1
                 print_progress_bar(verbose_i, total_ticks,
-                                   prefix=f'{candle["Close time"]}: {self.simulation_exchange.portfolio.portfolio_worth("BTC"):.2f}',
-                                   suffix=str(self.simulation_exchange.portfolio),
+                                   prefix=f'{candle["Close time"]}: {self.exchange.portfolio.portfolio_worth("BTC"):.2f}',
+                                   suffix=str(self.exchange.portfolio),
                                    length=10)
         return self.strategy.portfolio.order_book, concatenate_df
 

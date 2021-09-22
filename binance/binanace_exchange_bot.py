@@ -5,7 +5,7 @@ import schedule as schedule
 
 from binance.client import Client
 from binance import BinanceSocketManager
-from exchange_bots.ExchangeBot import ExchangeBot
+from binance_bot_simulation.exchange_bots.exchange_bot import ExchangeBot
 from binance_bot_simulation.binance import binance_portfolio
 
 

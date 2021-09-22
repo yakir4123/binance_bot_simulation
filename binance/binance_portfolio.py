@@ -1,4 +1,4 @@
-from exchange_bots.Portfolio import Portfolio
+from binance_bot_simulation.exchange_bots import Portfolio
 
 
 class BinancePortfolio(Portfolio):

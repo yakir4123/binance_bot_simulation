@@ -1,10 +1,11 @@
 import asyncio
+from typing import List
+
 import numpy as np
 import pandas as pd
 
 from common import mkdirs
 from binance.client import Client, AsyncClient
-
 
 INTERVALS = [
     Client.KLINE_INTERVAL_1MINUTE,
@@ -47,18 +48,20 @@ def change_df_types(df):
     df.set_index('Close time', inplace=True)
 
 
-async def download_raw_data(binance_client, interval, coin, quoted, start_time: pd.Timestamp, end_time: pd.Timestamp, verbose=False):
+async def download_raw_data(binance_client, interval, coin, quoted, start_time: pd.Timestamp, end_time: pd.Timestamp,
+                            verbose=False):
     symbol = coin + quoted
     try:
-        raw_df = pd.read_csv(f'cache/{symbol}/{start_time.strftime("%Y_%m_%d")}/{end_time.strftime("%Y_%m_%d")}/{interval}.csv')
+        raw_df = pd.read_csv(
+            f'cache/{symbol}/{start_time.strftime("%Y_%m_%d")}/{end_time.strftime("%Y_%m_%d")}/{interval}.csv')
         if 'isClose' not in raw_df.columns:
             raw_df['isClose'] = True
         if verbose:
-            print(f'read interval {interval} data')
+            print(f'read interval {symbol} {interval} data')
         change_df_types(raw_df)
     except FileNotFoundError:
         if verbose:
-            print(f'download interval {interval} data')
+            print(f'download interval {symbol} {interval} data')
         start_str = f'{start_time.timestamp()}'
         end_str = f'{end_time.timestamp()}'
         data = await binance_client.get_historical_klines(symbol, interval, start_str=start_str, end_str=end_str)
@@ -92,79 +95,48 @@ async def download_raw_data(binance_client, interval, coin, quoted, start_time: 
         if 'isClose' not in raw_df.columns:
             raw_df['isClose'] = True
         mkdirs(f'cache/{symbol}/{start_time.strftime("%Y_%m_%d")}/{end_time.strftime("%Y_%m_%d")}')
-        raw_df.to_csv(f'cache/{symbol}/{start_time.strftime("%Y_%m_%d")}/{end_time.strftime("%Y_%m_%d")}/{interval}.csv')
+        raw_df.to_csv(
+            f'cache/{symbol}/{start_time.strftime("%Y_%m_%d")}/{end_time.strftime("%Y_%m_%d")}/{interval}.csv')
 
     return raw_df
 
 
-async def __download_data(coin,
+async def __download_data(coins,
                           quoted,
-                          start_time,
-                          end_time=None,
-                          train_size=1.0,
+                          start_time: pd.Timestamp,
+                          end_time: pd.Timestamp = None,
                           verbose=False,
-                          train_n_test_intervals=None,
-                          train_intervals=None,
-                          test_intervals=None):
+                          intervals: List[str] = None):
     """
-    Download data from binance and split it into train and test data,
-    train meant for the strategy to prepare itself, and test is going to be the simulation itself
-    :param symbol: the symbol to download fromm
-    :param period: how many days to download
-    :param train_size: number in range of [0-1]
+    Download data from binance by coin name and quoted asset name for example coin='ETH' and quoted='BTC' will download
+    the dataframe for ETHBTC symbol
+    :param coin: the coin price that you want to download
+    :param quoted: the quoted asset that you want to download
     :param verbose: boolean to show what the download data is downloading now
-    :param train_n_test_intervals: list of intervals that you want to download for train and test part,
-                                    if None download only the 1hour klines
-    :param train_intervals: list of intervals that you want to download only for train part
-    :param test_intervals: list of intervals that you want to download only for test part
-    :return: train dataframe and test dataframe
-
-    todo:: implement the download only the train part
+    :param intervals: list of intervals that you want to download
+    :return: list of all data frames
     """
-    train = {}
-    test = {}
     binance_client = AsyncClient("", "")
-    if train_n_test_intervals is None:
-        train_n_test_intervals = []
-    if test_intervals is None:
-        test_intervals = []
-    if train_intervals is None:
-        train_intervals = []
-    train_n_test_dfs = await asyncio.gather(
-        *[download_raw_data(binance_client, interval, coin, quoted,
-                            start_time=start_time, end_time=end_time, verbose=verbose)
-          for interval in train_n_test_intervals]
-    )
-    for i in range(len(train_n_test_dfs)):
-        interval = train_n_test_intervals[i]
-        _df = train_n_test_dfs[i]
-        train[interval] = _df.iloc[:int(train_size * len(_df))]
-        test[interval] = _df.iloc[int(train_size * len(_df)):]
-    if train_size == 1:
-        await binance_client.session.close()
-        return train
-    # find the minimum of all tables for starting point
-    start_test_date = min([min(ts_entry.index) for ts_entry in test.values() if len(ts_entry.index) > 0])
+    if intervals is None:
+        raise ValueError('intervals parameter must be an interval value or iterator of intervals, interval value can '
+                         'be one of [1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M]')
+    if isinstance(intervals, str):
+        intervals = [intervals]
+    dfs = {coin: {} for coin in coins}
 
-    tests_df = await asyncio.gather(
-        *[download_raw_data(binance_client,
-                            interval,
-                            coin, quoted,
-                            verbose=verbose,
-                            start_time=pd.to_datetime(start_test_date).value / 1e6)
-          for interval in test_intervals]
-    )
-    for i in range(len(tests_df)):
-        interval = test_intervals[i]
-        test[interval] = tests_df[i]
-        test[interval]['isClose'] = True
+    async def download_task(coin, interval):
+        dfs[coin][interval] = await download_raw_data(binance_client, interval, coin, quoted,
+                                                      start_time=start_time, end_time=end_time, verbose=verbose)
 
+    await asyncio.gather(
+        *[download_task(coin, interval)
+          for coin in coins for interval in intervals]
+    )
     await binance_client.session.close()
-    return train, test
+    return dfs
 
 
 def download_data(*args, **kwargs):
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(
         __download_data(*args, **kwargs))
-

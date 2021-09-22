@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+from binance_bot_simulation.exchange_bots.exchange_bot import ExchangeBot
+
 
 class Strategy(ABC):
     callbacks = {}
@@ -15,46 +17,40 @@ class Strategy(ABC):
 
         return wrapped
 
-    def __init__(self, exchange, coins, quoted):
+    def __init__(self, coins, quoted):
         self.callbacks = Strategy.callbacks
-        self.__exchange = exchange
+        self.exchange: ExchangeBot = None
         self.coins = coins
         self.quoted = quoted
 
-    @property
-    def exchange(self):
-        return self.__exchange
+    def set_exchange(self, exchange):
+        self.exchange = exchange
 
     @property
     def portfolio(self):
-        return self.__exchange.portfolio
+        return self.exchange.portfolio
 
     def prepare_strategy(self):
         pass
 
+    @classmethod
     @abstractmethod
-    def update_new_candle(self, candle, time):
+    def get_train_intervals(cls):
         pass
 
-    @staticmethod
+    @classmethod
     @abstractmethod
-    def get_train_intervals():
+    def get_train_and_test_intervals(cls):
         pass
 
-    @staticmethod
+    @classmethod
     @abstractmethod
-    def get_train_and_test_intervals():
+    def get_test_intervals(cls):
         pass
 
-    @staticmethod
-    @abstractmethod
-    def get_test_intervals():
-        pass
-
-    async def candle_close(self, interval, timestamp, candle):
+    async def candle_close(self, interval, candle):
         callbacks = Strategy.callbacks[self.__module__]
         if interval not in callbacks:
             return
         callback = getattr(self, callbacks[interval])
-        await callback(interval, timestamp, candle)
-        self.__exchange.portfolio.update_history(timestamp, candle)
+        await callback(interval, candle)
