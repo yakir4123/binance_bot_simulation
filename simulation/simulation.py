@@ -12,6 +12,7 @@ from common import mkdirs, timing
 from binance_bot_simulation.exchange_bots.portfolio import InitialPortfolio
 from binance_bot_simulation.simulation.simulation_exchange_bot import SimulationExchangeBot
 from binance_bot_simulation.binance.binance_download_data import download_data, change_df_types
+from common.plot import plot_simulation
 
 
 class Simulation:
@@ -26,13 +27,16 @@ class Simulation:
                  simulation_start_time: pd.Timestamp = None,
                  verbose=True):
         self.verbose = verbose
-        self.strategy = None
         self.simulation_data_feeds = {}
         self.simulation_start_time = simulation_start_time
         self.exchange = SimulationExchangeBot()
         
     def create_portfolio(self, **coins):
         self.exchange.create_portfolio(self.simulation_start_time, **coins)
+
+    @property
+    def portfolio(self):
+        return self.exchange.portfolio
 
     def add_data_feed(self, coin: str, interval: str, data_feed: pd.DataFrame):
         if coin not in self.simulation_data_feeds:
@@ -43,8 +47,7 @@ class Simulation:
         self.exchange.add_history(coin, interval, data_feed.loc[data_feed.index < self.simulation_start_time])
 
     def add_strategy(self, strategy: Strategy):
-        self.strategy = strategy
-        self.strategy.set_exchange(self.exchange)
+        self.exchange.set_strategy(strategy)
 
     def start(self):
         """
@@ -56,9 +59,7 @@ class Simulation:
         loop.run_until_complete(self.async_start())
 
     async def async_start(self):
-        await self.strategy.prepare_strategy()
-        # free a lot of ram
-        self.exchange.history_data = None
+        await self.exchange.start()
 
         concatenate_df = []
         for coin, dfs in self.simulation_data_feeds.items():
@@ -75,7 +76,6 @@ class Simulation:
                                prefix=f'{concatenate_df.index[0]}: {self.exchange.portfolio.portfolio_worth():.2f}',
                                suffix=str(self.exchange.portfolio),
                                length=10)
-        timestamp = None
         for row in concatenate_df.itertuples():
             candle = {
                 'Close': row.Close,
@@ -88,12 +88,7 @@ class Simulation:
                 'Close time': row.Index,
                 'Coin': row.Coin
             }
-            self.exchange.record_candle(row.interval, candle)
-            await self.strategy.candle_close(row.interval, candle)
-
-            if candle['Close time'] != timestamp:
-                timestamp = candle['Close time']
-                self.exchange.update_orders(timestamp, candle['Close'])
+            await self.exchange.record_candle(row.interval, candle)
 
             if self.verbose:
                 verbose_i += 1
@@ -101,7 +96,51 @@ class Simulation:
                                    prefix=f'{candle["Close time"]}: {self.exchange.portfolio.portfolio_worth("BTC"):.2f}',
                                    suffix=str(self.exchange.portfolio),
                                    length=10)
-        return self.strategy.portfolio.order_book, concatenate_df
+        return self.exchange.strategy.portfolio.spot_order_book, concatenate_df
+
+    def plot(self, coin=None, interval=None,
+             spot_orders_plot=False,
+             future_orders_plot=False,
+             portfolio_division=False,
+             strategy_worth_as_coin=False,
+             strategy_indicators_plot=True,
+             strategy_worth_as_quoted=False,
+             ):
+        if coin is None:
+            coin = self.exchange.strategy.coins[0]
+        if interval is None:
+            interval = list(self.simulation_data_feeds[coin].keys())[0]
+        quoted = self.exchange.strategy.quoted
+
+        spot_order_book = None
+        if spot_orders_plot:
+            spot_order_book = pd.DataFrame(self.portfolio.spot_order_book)
+            spot_order_book = spot_order_book.set_index('Time')
+
+        future_order_book = None
+        if future_orders_plot:
+            future_order_book = pd.DataFrame(self.portfolio.future_order_book)
+
+        coin_worth = None
+        if strategy_worth_as_coin:
+            coin_worth = self.portfolio.history_worth(name='Strategy', coin=coin)
+
+        quoted_worth = None
+        if strategy_worth_as_quoted:
+            quoted_worth = self.portfolio.history_worth(name='Strategy', coin=quoted)
+
+        strategy_indicators = None
+        if strategy_indicators_plot:
+            strategy_indicators = self.exchange.strategy.indicators_graph_objects()
+
+        df = self.simulation_data_feeds[coin][interval]
+        plot_simulation(df=df,
+                        order_book=spot_order_book,
+                        coin_bot_performance=coin_worth,
+                        quoted_bot_performance=quoted_worth,
+                        future_order_book=future_order_book,
+                        strategy_indicators=strategy_indicators
+                        )
 
 
 @timing
@@ -190,7 +229,7 @@ def full_simulation(coins: Iterable,
                             verbose=verbose)
 
     simulation.start()
-    order_book = exchange.portfolio.order_book
+    order_book = exchange.portfolio.spot_order_book
 
     df = simulation.simulation_data['BTC'][simulation_data_df]
     portfolio = exchange.portfolio

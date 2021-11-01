@@ -1,20 +1,22 @@
-from abc import ABC, abstractmethod
-
 from binance import Client
-
+from abc import ABC, abstractmethod
 from binance_bot_simulation.other.circular_queue import CircularQueue
 
 
 class ExchangeBot(ABC):
 
     def __init__(self, memory_length=500):
+        self.strategy = None
         self.portfolio = None
         # history_data will be available only for prepare stage
         self.history_data = {}
-        self.number_of_trades = 0
         self.memory_length = memory_length
-
         self.ohlc = {key: {} for key in ['Open', 'High', 'Low', 'Close']}
+        self.tasks = []
+
+    def set_strategy(self, strategy):
+        self.strategy = strategy
+        self.strategy.set_exchange(self)
 
     def add_history(self, coin, interval, history_data):
         if coin not in self.history_data:
@@ -35,9 +37,17 @@ class ExchangeBot(ABC):
                 self.ohlc[key][coin] = {}
             self.ohlc[key][coin][interval] = CircularQueue(history_data[key].values, self.memory_length)
 
-    def record_candle(self, interval, candle):
+    async def start(self):
+        await self.strategy.prepare_strategy()
+        # free a lot of ram
+        self.history_data = None
+
+    async def record_candle(self, interval, candle):
         [self.ohlc[key][candle['Coin']][interval].enqueue(candle[key]) for key in self.ohlc]
         self.portfolio.update_history(candle['Close time'], candle)
+
+        self.strategy.candle_close(interval, candle)
+        await self.update(candle)
 
     @property
     @abstractmethod
@@ -47,6 +57,18 @@ class ExchangeBot(ABC):
         """
         pass
 
+    @abstractmethod
+    def update_orders(self, timestamp, price: float):
+        pass
+
+    @abstractmethod
+    async def _set_order(self, order):
+        pass
+
+    @abstractmethod
+    def _close_future_position(self, timestamp, coin, size, curr_price):
+        pass
+
     def cancel_all_orders(self, timestamp):
         """
          cancel all open orders and notify the strategy.
@@ -54,100 +76,57 @@ class ExchangeBot(ABC):
         """
         [order.on_order_canceled(order, timestamp) for order in self.open_orders]
 
-    @abstractmethod
-    async def set_order(self, order):
+    def close_future_position(self, symbol, size=None, percent=None):
+        if symbol not in self.portfolio.future_positions:
+            return
+        if (size is None and percent is None) or (size is not None and percent is not None):
+            percent = 1
+        position_size = self.portfolio.future_positions[symbol] * percent
+        if percent is not None:
+            size = position_size * percent
+        self.tasks.append(ExchangeTask(ExchangeTask.CLOSE_FUTURE_POSITION, symbol=symbol, size=size))
+
+    def set_order(self, order):
         """
         Set order in the open order book
         :param order: The order
         """
-        pass
+        if order.price * order.amount < 20:
+            return
+        self.tasks.append(ExchangeTask(ExchangeTask.ORDER, order=order))
+
+    async def update(self, candle):
+        for task in self.tasks:
+            if task.type == ExchangeTask.ORDER:
+                await self._set_order(task['order'])
+            elif task.type == ExchangeTask.CLOSE_FUTURE_POSITION:
+                await self._close_future_position(candle['Close time'], task['coin'], task['size'], candle['Close'])
+        self.tasks = []
+        self.update_orders(candle['Close time'], candle['Close'])
 
     def open(self, coin, interval, klines):
-        return self.ohlc['Open'][coin][interval][:klines]
+        return self.ohlc['Open'][coin][interval][:-klines]
 
     def high(self, coin, interval, klines=1):
-        return self.ohlc['High'][coin][interval][:klines]
+        return self.ohlc['High'][coin][interval][:-klines]
 
     def low(self, coin, interval, klines=1):
-        return self.ohlc['Low'][coin][interval][:klines]
+        return self.ohlc['Low'][coin][interval][:-klines]
 
     def close(self, coin, interval, klines=1):
-        return self.ohlc['Close'][coin][interval][:klines]
+        return self.ohlc['Close'][coin][interval][:-klines]
 
     def __str__(self):
-        return f'trades = {self.number_of_trades} {str(self.portfolio)}'
+        return str(self.portfolio)
 
 
-class Order(ABC):
-    MARKET = 0
-    LIMIT = 1
-    STOP_LIMIT = 2
+class ExchangeTask:
+    ORDER = 0
+    CLOSE_FUTURE_POSITION = 1
 
-    def __init__(self):
-        self.price = 0
-        self.total_filled = 0
+    def __init__(self, type, **kwargs):
+        self.type = type
+        self.values = kwargs
 
-    def filled(self, order, timestamp, curr_price, amount_filled):
-        pass
-
-    def on_order_canceled(self, order, timestamp):
-        pass
-
-
-class SpotOrder(Order):
-    BUY = Client.SIDE_BUY
-    SELL = Client.SIDE_SELL
-
-    FEE = 0.1 / 100  # 0.1%
-    __id = 0
-
-    def __init__(self, order_type, side, coin, quoted, amount, timestamp):
-        super().__init__()
-        self.id = SpotOrder.__id
-        self.side = side
-        self.coin = coin
-        self.quoted = quoted
-        self.amount = amount
-        self.order_type = order_type
-        self.timestamp = timestamp
-
-        SpotOrder.__id += 1
-
-
-class MarketSpotOrder(SpotOrder):
-
-    def __init__(self, curr_price, **kwargs):
-        super().__init__(order_type=SpotOrder.MARKET, **kwargs)
-        self.price = curr_price
-
-
-class StopLimitSpotOrder(SpotOrder):
-
-    def __init__(self, price, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.price = price
-
-
-class FutureOrder(Order):
-    LONG = 1
-    SHORT = -1
-
-    FEE = 0.1 / 100  # 0.1%
-    __id = 0
-
-    def __init__(self, order_type, position, coin, amount, leverage):
-        super().__init__()
-        self.id = FutureOrder.__id
-        self.position = position
-        self.coin = coin
-        self.order_type = order_type
-        self.amount = amount
-        self.leverage = leverage
-
-        FutureOrder.__id += 1
-
-
-class MarketFutureOrder(FutureOrder):
-
-    def __init__(self, position, coin, leverage, usdt_amount, curr_price):
-        super().__init__(Order.MARKET, position, coin, usdt_amount / curr_price, leverage)
+    def __getitem__(self, item):
+        return self.values[item]

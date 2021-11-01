@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from binance_bot_simulation.exchange_bots.exchange_bot import SpotOrder, FutureOrder
+from binance_bot_simulation.exchange_bots.future_position import FuturePositions
+from binance_bot_simulation.exchange_bots.orders import SpotOrder, FutureOrder
 
 
 class InitialPortfolio:
@@ -34,7 +35,7 @@ class Portfolio:
         self.start_worth = 0
         self.__fee = fee / 100
         self.last_update = timestamp
-        self.future_positions = []
+        self.future_positions = {}
 
         self.available_coins = list(coins.keys())
         history_columns_names = list(sum([(f'{coin_name} Amount',
@@ -43,12 +44,15 @@ class Portfolio:
                                           for coin_name in self.available_coins], ()))
 
         self.history_dict = {timestamp: {}}
-        self.order_book = []
+        self.spot_order_book = []
+        self.future_order_book = []
         for coin_symbol, (amount, price) in coins.items():
             self.history_dict[timestamp][f'{coin_symbol} Amount'] = amount
             self.history_dict[timestamp][f'{coin_symbol} A. Price'] = price
             self.history_dict[timestamp][f'{coin_symbol} Price'] = price
             self.start_worth += amount * price
+        self.history_dict[timestamp]['Future margin balance'] = 0
+        self.history_dict[timestamp]['Future unrealized PNL'] = 0
         self.__history = pd.DataFrame(columns=history_columns_names)
 
     def on_order_filled(self, order, timestamp):
@@ -63,7 +67,8 @@ class Portfolio:
         :param order: the order that updated the
         :param timestamp: when this update happened
         """
-        order_as_dict = {
+        spot_order_as_dict = {
+            'Id': order.id,
             'Time': timestamp,
             'Coin': order.coin,
             'Quoted Symbol': order.quoted,
@@ -71,7 +76,7 @@ class Portfolio:
             'Price': order.price,
             'Side': 'BUY' if order.side == SpotOrder.BUY else 'SELL',
             'filled': order.total_filled,
-            'Percent': 0.5
+            'Percent': None
         }
 
         last_timestamp = self.history_dict[self.last_update].copy()
@@ -99,24 +104,113 @@ class Portfolio:
         else:
             raise ValueError(f'There is invalid value in order book ({order.side})')
 
-        order_as_dict['Percent'] = percent
+        spot_order_as_dict['Percent'] = percent
         last_timestamp[f'{order.coin} Amount'] += amount
         last_timestamp[f'{order.quoted} Amount'] += quoted
         last_timestamp[f'{order.coin} A. Price'] = avg
 
-        self.order_book.append(order_as_dict)
+        self.spot_order_book.append(spot_order_as_dict)
 
         self.history_dict[timestamp] = last_timestamp
         self.last_update = timestamp
 
     def future_order_update(self, order, timestamp):
-        position = FuturePositions(timestamp=timestamp,
-                                   contract=order.coin + 'USDT',
-                                   size=order.amount,
-                                   entry_price=order.price,
-                                   position=order.position,
-                                   leverage=order.leverage)
-        self.future_positions.append(position)
+
+        future_order_as_dict = {
+            'Id': order.id,
+            'Time': timestamp,
+            'Symbol': order.symbol,
+            'Amount': order.amount,
+            'Price': order.price,
+            'Side': 'LONG' if order.position == FutureOrder.LONG else 'SHORT',
+            'Filled': order.total_filled,
+            'Percent': None
+        }
+        order_margin = order.price * order.amount
+        last_timestamp = self.history_dict[self.last_update].copy()
+        percent = order_margin / last_timestamp[f'USDT Amount']
+        future_order_as_dict['Percent'] = percent
+        self.future_order_book.append(future_order_as_dict)
+
+        # add position to the positions list
+        if order.symbol not in self.future_positions:
+            position = FuturePositions(timestamp=timestamp,
+                                       contract=order.symbol,
+                                       size=order.amount,
+                                       entry_price=order.price,
+                                       position=order.position,
+                                       leverage=order.leverage,)
+            self.future_positions[order.symbol] = position
+            last_timestamp['USDT Amount'] -= order_margin
+            last_timestamp['Future margin balance'] += order_margin
+        else:
+            position = self.future_positions[order.symbol]
+            if position.leverage != order.leverage:
+                raise ValueError('leverage cant be different between same positions')
+            # if make the position bigger
+            if order.position == position.position:
+                position.entry_price = ((position.entry_price * position.size) + (order.price * order.amount)) / (position.size + order.amount)
+                position.size += order.amount
+                last_timestamp['USDT Amount'] -= order_margin
+                last_timestamp['Future margin balance'] += order_margin
+            else:
+                # if the order is smaller than the actual position
+                if order.amount <= position.size:
+                    pnl, margin = position.close_position(order.amount, last_timestamp[f'{order.coin} Price'])
+                    # add the pnl and the margin to the wallet
+                    last_timestamp['USDT Amount'] += pnl + margin
+
+                    # remove this numbers from the future position
+                    last_timestamp['Future unrealized PNL'] -= pnl
+                    last_timestamp['Future margin balance'] -= margin
+                else:
+                    pnl, margin = position.close_position(position.size, last_timestamp[f'{order.coin} Price'])
+                    # add the pnl and the margin to the wallet
+                    last_timestamp['USDT Amount'] += pnl + margin
+
+                    # remove this numbers from the future position
+                    last_timestamp['Future unrealized PNL'] -= pnl
+                    last_timestamp['Future margin balance'] -= margin
+
+                    # now create new position instead
+                    position = FuturePositions(timestamp=timestamp,
+                                               contract=order.symbol,
+                                               size=order.amount - position.size,
+                                               entry_price=order.price,
+                                               position=order.position,
+                                               leverage=order.leverage)
+                    self.future_positions[order.symbol] = position
+                    last_timestamp['USDT Amount'] -= order_margin
+                    last_timestamp['Future margin balance'] += order_margin
+
+        self.history_dict[timestamp] = last_timestamp
+        self.last_update = timestamp
+
+    def close_future_position(self, timestamp, coin, size, curr_price):
+        try:
+            position = self.future_positions[coin]
+        except KeyError:
+            return
+
+        new_update = self.history_dict[timestamp].copy()
+        pnl, margin = position.close_future_position(size, curr_price)
+        print(f'{timestamp}\npnl: {pnl}')
+        new_update['USDT Amount'] += pnl + margin
+
+        # remove this numbers from the future position
+        new_update['Future unrealized PNL'] -= pnl
+        new_update['Future margin balance'] -= margin
+        self.history_dict[timestamp] = new_update
+        self.last_update = timestamp
+
+    def check_future_position_liquid(self, candle):
+        to_remove = []
+        for position in self.future_positions:
+            if position.is_got_liquid(candle):
+                to_remove.append(position.symbol)
+
+        for symbol in to_remove:
+            del self.future_positions[symbol]
 
     def update_history(self, timestamp, candle):
         if timestamp not in self.history_dict:
@@ -128,7 +222,14 @@ class Portfolio:
 
             self.history_dict[timestamp] = last_timestamp
         self.history_dict[timestamp][f'{candle["Coin"]} Price'] = candle["Close"]
+        self.history_dict[timestamp]['Future unrealized PNL'] = self.calculate_unrealized_pnl(candle["Close"])
         self.last_update = timestamp
+
+    def calculate_unrealized_pnl(self, curr_price):
+        upnl = 0
+        for id, position in self.future_positions.items():
+            upnl = position.pnl(curr_price)
+        return upnl
 
     def history(self, period=0):
         if period > 0:
@@ -199,14 +300,19 @@ class Portfolio:
         """
         :return: how much this portfolio worth
         """
+
+        if self.last_update in self.history_dict:
+            last_update = self.history_dict[self.last_update]
+        else:
+            last_update = self.__history.loc[self.last_update]
         if coin is None:
             coin_price = 1
         else:
-            try:
-                coin_price = self.history_dict[self.last_update][f'{coin} Price']
-            except KeyError:
-                coin_price = self.__history.loc[self.last_update][f'{coin} Price']
-        return sum(self.dollar_status().values()) / coin_price
+            coin_price = last_update[f'{coin} Price']
+        future = last_update[f'Future margin balance']
+        future += last_update[f'Future unrealized PNL']
+        res = sum(self.dollar_status().values()) + future
+        return res / coin_price
 
     def history_worth(self, coin, name=''):
         history = self.history()
@@ -236,6 +342,11 @@ class Portfolio:
             part_of_wallet = dollar_status[coin] / self.portfolio_worth() * 100
             part_of_wallet = Portfolio.__percent_color(f'{part_of_wallet:.1f}')
             res += f'| {amount} {coin} [{price}] {part_of_wallet} '
+
+        margin = Portfolio.__print_blue(f'{self.history_dict[self.last_update]["Future margin balance"]:.1f}')
+        upnl = Portfolio.__print_blue(f'{self.history_dict[self.last_update]["Future unrealized PNL"]:.1f}')
+        res += f'| Future margin [{margin}] '
+        res += f'| Future uPNL [{upnl}] '
         return res
 
     @staticmethod
@@ -255,59 +366,4 @@ class Portfolio:
         else:
             color = '\033[91m'
         return color + out + '%\033[0m'
-
-
-class FuturePositions:
-    __ID = 0
-    SHORT = -1
-    LONG = 1
-
-    def __init__(self, timestamp, contract, size, entry_price, position, leverage):
-        self.id = FuturePositions.__ID
-        FuturePositions.__ID += 1
-        self.timestamp = timestamp
-        self.contract = contract
-        self.entry_price = entry_price
-        self.position = position
-        self.size = size
-        self.leverage = leverage
-        self.liquid_price = entry_price - entry_price / leverage
-
-    def pnl(self, mark_price):
-        """
-        :param mark_price: current price
-        :return: the profit / loss of this contract for the current price
-        """
-        return (mark_price - self.entry_price) * self.size * self.position
-
-    def is_got_liquid(self, candle):
-        """
-        in case that the contract got close during this candle
-        the size of this contract is set to 0 and should be closed.
-        :param candle: the last candle to check if this candle got closed.
-        :return: true if the contract got close
-        """
-        price = candle['Low']
-        # (price / self.entry_price - 1) * self.position <= -1 / self.leverage
-        res = self.pnl(price) <= -self.entry_price * self.size / self.leverage
-        if res:
-            self.size = 0
-
-        return self.size == 0
-
-    def close_position(self, size, mark_price):
-        """
-        Close a position by the size of values that you want to close
-        for example the position on 1 BTC and you want to close only 1/3 in when the price is reached to 60K
-        than size should be 1/3 and price needs to be 60k
-
-        * notice this method is assume that the price is the current price and not set a profit limit order for it
-        :param size: the size of the contract you want to close
-        :param mark_price: the current price of the contract
-        :return: the profit / lose of this close contract.
-        """
-        if size > self.size:
-            raise ValueError('Try to close position more than the position has')
-        self.size -= size
-        return (mark_price - self.entry_price) * size * self.position
 

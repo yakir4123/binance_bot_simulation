@@ -1,7 +1,8 @@
 import pandas as pd
 
+from binance_bot_simulation.exchange_bots.orders import Order
 from binance_bot_simulation.exchange_bots.portfolio import Portfolio
-from binance_bot_simulation.exchange_bots.exchange_bot import ExchangeBot, SpotOrder, Order
+from binance_bot_simulation.exchange_bots.exchange_bot import ExchangeBot
 
 
 class SimulationExchangeBot(ExchangeBot):
@@ -47,14 +48,15 @@ class SimulationExchangeBot(ExchangeBot):
         super().cancel_all_orders(timestamp)
         self.__open_orders.clear()
 
-    async def set_order(self, order):
+    async def _set_order(self, order):
         """
         Add new order to the open orders
         :param order: the order tobe added
         """
-        # ignore orders that smaller than 20$
-        if order.price * order.amount > 20:
-            self.open_orders.append(order)
+        self.open_orders.append(order)
+
+    async def _close_future_position(self, timestamp, coin, size, curr_price):
+        self.portfolio.close_future_position(timestamp, coin, size, curr_price)
 
     def update_orders(self, timestamp: pd.Timestamp, price: float):
         for order in self.open_orders:

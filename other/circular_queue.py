@@ -44,16 +44,26 @@ class CircularQueue:
 
     def __getitem__(self, key) -> int:
         if isinstance(key, slice):
-            # todo:: implement a slice.start and slice.step
+
             if key.start is not None and key.start != 0:
                 raise ValueError("Not implemented yet :/ slice start must be 0")
             if key.step is not None and key.step != 1:
                 raise ValueError("Not implemented yet :/ slice step must be 1")
-            if self.queue_head + key.stop < self.max_length:
-                return self.rec_queue[self.queue_head:self.queue_head + key.stop]
+            if key.stop is None:
+                key.stop = self.max_length - 1
+            start = self.queue_head
+            stop = self.queue_head + key.stop
+            if stop < start:
+                start = (self.queue_head + self.max_length + key.stop) % self.max_length
+                stop = (start - key.stop) % self.max_length
+                if stop == 0:
+                    stop = self.max_length
+
+            if start < stop:
+                return self.rec_queue[start:stop]
             else:
-                return np.concatenate((self.rec_queue[self.queue_head:],
-                                       self.rec_queue[:(self.queue_head + key.stop) % self.max_length]), axis=None)
+                return np.concatenate((self.rec_queue[start:],
+                                       self.rec_queue[:stop]), axis=None)
 
         # the item we want will be at head + index
         loc = (self.queue_head + key) % self.max_length

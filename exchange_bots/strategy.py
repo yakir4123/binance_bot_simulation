@@ -33,24 +33,12 @@ class Strategy(ABC):
     def prepare_strategy(self):
         pass
 
-    @classmethod
-    @abstractmethod
-    def get_train_intervals(cls):
-        pass
+    def indicators_graph_objects(self):
+        return None
 
-    @classmethod
-    @abstractmethod
-    def get_train_and_test_intervals(cls):
-        pass
-
-    @classmethod
-    @abstractmethod
-    def get_test_intervals(cls):
-        pass
-
-    async def candle_close(self, interval, candle):
+    def candle_close(self, interval, candle):
         callbacks = Strategy.callbacks[self.__module__]
         if interval not in callbacks:
             return
         callback = getattr(self, callbacks[interval])
-        await callback(interval, candle)
+        callback(interval, candle)
